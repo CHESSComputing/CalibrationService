@@ -113,6 +113,8 @@ changes:
 	./changes.sh
 	./last_changes.sh
 
+test: test_code
+
 test_code:
 	touch ~/.foxden.yaml
 	go test -test.v .
