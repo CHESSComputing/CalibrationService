@@ -34,6 +34,34 @@ of last Tuesday" stays answerable.
 
 ## Running it
 
+Install and manage your PostgresDB, e.g.
+```bash
+# pull out docker image
+docker pull postgres:17
+
+# run pdb
+docker run -d \
+  --name postgres17 \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=secret \
+  -e POSTGRES_DB=testdb \
+  -p 5432:5432 \
+  -v postgres-data:/var/lib/postgresql/data \
+  postgres:17
+
+# access db
+docker exec -it postgres17 psql -U postgres -d testdb
+
+# create schema
+cat static/schema/schema.sql | docker exec -i postgres17 psql -U postgres -d testdb
+
+# usefull commands
+docker logs postgres17
+docker stop postgres17
+docker start postgres17
+docker rm -f postgres17
+```
+
 ```bash
 # 1. start Postgres (any 14+ works; needs btree_gist, created by schema.sql)
 docker run -d --name foxden-calib-pg -e POSTGRES_USER=foxden \
