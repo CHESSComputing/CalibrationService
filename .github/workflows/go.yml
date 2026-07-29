@@ -53,7 +53,7 @@ jobs:
           psql -h localhost \
                -U postgres \
                -d testdb \
-               -f schema.sql
+               -f static/schema/schema.sql
 
       - name: Update foxden.yaml
         run: |
