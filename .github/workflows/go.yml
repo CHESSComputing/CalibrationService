@@ -1,6 +1,3 @@
-# This workflow will build a golang project
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
-
 name: Go
 
 on:
@@ -10,28 +7,72 @@ on:
     branches: [ "main" ]
 
 jobs:
-
   build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        mongodb-version: ['4.4.14', '5.0.9', '6.0.11', '7.0.2', 'latest']
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: testdb
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d testdb"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
     steps:
-    - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.24'
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
 
-    - name: Build
-      run: make
+      - name: Wait for PostgreSQL
+        run: |
+          until pg_isready -h localhost -U postgres -d testdb; do
+            sleep 2
+          done
+        env:
+          PGPASSWORD: secret
 
-    - name: Start MongoDB
-      uses: MongoCamp/mongodb-github-action@1.3.0
-      with:
-        mongodb-version: ${{ matrix.mongodb-version }}
-        mongodb-port: 8230
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
 
-    - name: Test
-      run: make test
+      - name: Create database schema
+        env:
+          PGPASSWORD: secret
+        run: |
+          psql -h localhost \
+               -U postgres \
+               -d testdb \
+               -f schema.sql
+
+      - name: Update foxden.yaml
+        run: |
+          cat >> foxden.yaml <<'EOF'
+
+          CalibrationData:
+            DBUri: postgres://postgres:secret@localhost:5432/testdb?sslmode=disable
+            WebServer:
+              Name: foxden-calibration-service
+              Port: 8399
+              Verbose: 1
+              LogFile: /tmp/CalibrationService.log
+              LogLongFile: true
+              GinOptions:
+                DisableConsoleColor: true
+          EOF
+
+      - name: Build
+        run: make
+
+      - name: Test
+        run: make test
