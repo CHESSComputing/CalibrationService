@@ -48,7 +48,7 @@ func Server() {
 
 	dsn := srvConfig.Config.CalibrationData.DBUri
 	if dsn == "" {
-		dsn = "postgres://foxden:foxden@localhost:5432/foxden_calib?sslmode=disable"
+		log.Fatal("unable to get CalibrationData.DBUri foxden parameter")
 	}
 
 	store, err := NewStore(dsn)
