@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -16,8 +17,9 @@ import (
 
 // Sentinel errors surfaced to the handler layer.
 var (
-	ErrOverlap  = errors.New("interval of validity overlaps an existing active IOV for this tag/channel")
-	ErrNotFound = errors.New("not found")
+	ErrOverlap     = errors.New("interval of validity overlaps an existing active IOV for this label/channel")
+	ErrNotFound    = errors.New("not found")
+	ErrInvalidData = errors.New("invalid request")
 )
 
 // Store wraps a database/sql handle with the calibration-specific queries.
@@ -60,36 +62,70 @@ func isExclusionViolation(err error) bool {
 	return false
 }
 
-// GetOrCreateTag returns the id of an existing tag, creating it if absent.
-func (s *Store) GetOrCreateTag(ctx context.Context, name, description string) (int64, error) {
+// normalizeLabel validates and cleans a hierarchical label path, e.g.
+// "/3b/btr123/cycle123/sampleName". It requires a leading "/", rejects
+// empty segments ("//"), and strips any trailing "/".
+func normalizeLabel(label string) (string, error) {
+	if label == "" || label == "/" {
+		return "", fmt.Errorf("%w: label must not be empty", ErrInvalidData)
+	}
+	if !strings.HasPrefix(label, "/") {
+		return "", fmt.Errorf("%w: label must start with '/', got %q", ErrInvalidData, label)
+	}
+	trimmed := strings.TrimRight(label, "/")
+	if trimmed == "" {
+		return "", fmt.Errorf("%w: label must not be empty", ErrInvalidData)
+	}
+	for _, seg := range strings.Split(trimmed, "/") {
+		if seg == "" {
+			continue // leading "/" produces one empty seg, that's fine
+		}
+		if strings.TrimSpace(seg) != seg {
+			return "", fmt.Errorf("%w: label segments must not have surrounding whitespace: %q", ErrInvalidData, label)
+		}
+	}
+	return trimmed, nil
+}
+
+// GetOrCreateLabel returns the id of an existing label, creating it if absent.
+// Internally this is still the "tags" table (see static/schema/schema.sql);
+// "label" is the API-facing name for tags.name.
+func (s *Store) GetOrCreateLabel(ctx context.Context, label, description string) (int64, error) {
 	var id int64
-	err := s.db.QueryRowContext(ctx, `SELECT id FROM tags WHERE name = $1`, name).Scan(&id)
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM tags WHERE name = $1`, label).Scan(&id)
 	if err == nil {
 		return id, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf("lookup tag: %w", err)
+		return 0, fmt.Errorf("lookup label: %w", err)
 	}
 	err = s.db.QueryRowContext(ctx,
 		`INSERT INTO tags (name, description) VALUES ($1, $2) RETURNING id`,
-		name, description,
+		label, description,
 	).Scan(&id)
 	if err != nil {
-		return 0, fmt.Errorf("insert tag: %w", err)
+		return 0, fmt.Errorf("insert label: %w", err)
 	}
 	return id, nil
 }
 
 // InsertCalibration writes a new payload and a new IOV row for it in a single
 // transaction. The "no_overlap" exclusion constraint on iovs is what actually
-// prevents two active, overlapping validity ranges for the same tag+channel;
+// prevents two active, overlapping validity ranges for the same label+channel;
 // a violation is translated into ErrOverlap.
-func (s *Store) InsertCalibration(ctx context.Context, req CreateCalibrationRequest) (*IOV, error) {
+func (s *Store) InsertCalibration(ctx context.Context, req CalibrationRequest) (*CalibrationIOV, error) {
+	label, err := normalizeLabel(req.Label)
+	if err != nil {
+		return nil, err
+	}
+	if len(req.Data) == 0 {
+		return nil, fmt.Errorf("%w: data must not be empty", ErrInvalidData)
+	}
 	if req.Since >= req.Till {
-		return nil, fmt.Errorf("since (%d) must be < till (%d)", req.Since, req.Till)
+		return nil, fmt.Errorf("%w: since (%d) must be < till (%d)", ErrInvalidData, req.Since, req.Till)
 	}
 
-	tagID, err := s.GetOrCreateTag(ctx, req.Tag, "")
+	labelID, err := s.GetOrCreateLabel(ctx, label, "")
 	if err != nil {
 		return nil, err
 	}
@@ -103,20 +139,20 @@ func (s *Store) InsertCalibration(ctx context.Context, req CreateCalibrationRequ
 	var payloadID int64
 	err = tx.QueryRowContext(ctx,
 		`INSERT INTO payloads (tag_id, data, checksum) VALUES ($1, $2, $3) RETURNING id`,
-		tagID, []byte(req.Data), checksum(req.Data),
+		labelID, []byte(req.Data), checksum(req.Data),
 	).Scan(&payloadID)
 	if err != nil {
 		return nil, fmt.Errorf("insert payload: %w", err)
 	}
 
-	var iov IOV
+	var iov CalibrationIOV
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO iovs (tag_id, channel_id, payload_id, since, till, inserted_by, comment)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		RETURNING id, tag_id, channel_id, payload_id, since, till, revision,
 		          is_active, inserted_at, coalesce(inserted_by, ''), coalesce(comment, '')`,
-		tagID, req.ChannelID, payloadID, req.Since, req.Till, req.InsertedBy, req.Comment,
-	).Scan(&iov.ID, &iov.TagID, &iov.ChannelID, &iov.PayloadID, &iov.Since, &iov.Till,
+		labelID, req.ChannelID, payloadID, req.Since, req.Till, req.InsertedBy, req.Comment,
+	).Scan(&iov.ID, &iov.LabelID, &iov.ChannelID, &iov.PayloadID, &iov.Since, &iov.Till,
 		&iov.Revision, &iov.IsActive, &iov.InsertedAt, &iov.InsertedBy, &iov.Comment)
 	if err != nil {
 		if isExclusionViolation(err) {
@@ -128,16 +164,20 @@ func (s *Store) InsertCalibration(ctx context.Context, req CreateCalibrationRequ
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit: %w", err)
 	}
-	iov.TagName = req.Tag
+	iov.Label = label
 	return &iov, nil
 }
 
-// GetValidCalibration resolves the active IOV (and its payload) for a tag +
+// GetValidCalibration resolves the active IOV (and its payload) for a label +
 // channel whose validity range contains "at" (a run number or timestamp).
-func (s *Store) GetValidCalibration(ctx context.Context, tag string, channelID, at int64) (*IOV, json.RawMessage, error) {
-	var iov IOV
+func (s *Store) GetValidCalibration(ctx context.Context, label string, channelID, at int64) (*CalibrationIOV, json.RawMessage, error) {
+	label, err := normalizeLabel(label)
+	if err != nil {
+		return nil, nil, err
+	}
+	var iov CalibrationIOV
 	var data json.RawMessage
-	err := s.db.QueryRowContext(ctx, `
+	err = s.db.QueryRowContext(ctx, `
 		SELECT i.id, i.tag_id, t.name, i.channel_id, i.payload_id, i.since, i.till,
 		       i.revision, i.is_active, i.inserted_at,
 		       coalesce(i.inserted_by, ''), coalesce(i.comment, ''), p.data
@@ -147,8 +187,8 @@ func (s *Store) GetValidCalibration(ctx context.Context, tag string, channelID, 
 		WHERE t.name = $1 AND i.channel_id = $2 AND i.is_active
 		  AND i.validity @> $3::bigint
 		LIMIT 1`,
-		tag, channelID, at,
-	).Scan(&iov.ID, &iov.TagID, &iov.TagName, &iov.ChannelID, &iov.PayloadID, &iov.Since, &iov.Till,
+		label, channelID, at,
+	).Scan(&iov.ID, &iov.LabelID, &iov.Label, &iov.ChannelID, &iov.PayloadID, &iov.Since, &iov.Till,
 		&iov.Revision, &iov.IsActive, &iov.InsertedAt, &iov.InsertedBy, &iov.Comment, &data)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, ErrNotFound
@@ -159,8 +199,12 @@ func (s *Store) GetValidCalibration(ctx context.Context, tag string, channelID, 
 	return &iov, data, nil
 }
 
-// ListCalibrations returns all active IOVs for a tag, optionally filtered by channel.
-func (s *Store) ListCalibrations(ctx context.Context, tag string, channelID *int64) ([]IOV, error) {
+// ListCalibrations returns all active IOVs for a label, optionally filtered by channel.
+func (s *Store) ListCalibrations(ctx context.Context, label string, channelID *int64) ([]CalibrationIOV, error) {
+	label, err := normalizeLabel(label)
+	if err != nil {
+		return nil, err
+	}
 	query := `
 		SELECT i.id, i.tag_id, t.name, i.channel_id, i.payload_id, i.since, i.till,
 		       i.revision, i.is_active, i.inserted_at,
@@ -168,7 +212,7 @@ func (s *Store) ListCalibrations(ctx context.Context, tag string, channelID *int
 		FROM iovs i
 		JOIN tags t ON t.id = i.tag_id
 		WHERE t.name = $1 AND i.is_active`
-	args := []interface{}{tag}
+	args := []interface{}{label}
 	if channelID != nil {
 		query += ` AND i.channel_id = $2`
 		args = append(args, *channelID)
@@ -181,10 +225,10 @@ func (s *Store) ListCalibrations(ctx context.Context, tag string, channelID *int
 	}
 	defer rows.Close()
 
-	var out []IOV
+	var out []CalibrationIOV
 	for rows.Next() {
-		var iov IOV
-		if err := rows.Scan(&iov.ID, &iov.TagID, &iov.TagName, &iov.ChannelID, &iov.PayloadID,
+		var iov CalibrationIOV
+		if err := rows.Scan(&iov.ID, &iov.LabelID, &iov.Label, &iov.ChannelID, &iov.PayloadID,
 			&iov.Since, &iov.Till, &iov.Revision, &iov.IsActive, &iov.InsertedAt,
 			&iov.InsertedBy, &iov.Comment); err != nil {
 			return nil, fmt.Errorf("scan iov: %w", err)
@@ -195,9 +239,13 @@ func (s *Store) ListCalibrations(ctx context.Context, tag string, channelID *int
 }
 
 // GetHistory returns every IOV revision (active and superseded) for a
-// tag+channel, in validity order - useful for auditing "what did we think
+// label+channel, in validity order - useful for auditing "what did we think
 // the constants were at insert time T", independent of later corrections.
-func (s *Store) GetHistory(ctx context.Context, tag string, channelID int64) ([]IOV, error) {
+func (s *Store) GetHistory(ctx context.Context, label string, channelID int64) ([]CalibrationIOV, error) {
+	label, err := normalizeLabel(label)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT i.id, i.tag_id, t.name, i.channel_id, i.payload_id, i.since, i.till,
 		       i.revision, i.is_active, i.inserted_at,
@@ -206,17 +254,17 @@ func (s *Store) GetHistory(ctx context.Context, tag string, channelID int64) ([]
 		JOIN tags t ON t.id = i.tag_id
 		WHERE t.name = $1 AND i.channel_id = $2
 		ORDER BY i.since, i.revision`,
-		tag, channelID,
+		label, channelID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("history query: %w", err)
 	}
 	defer rows.Close()
 
-	var out []IOV
+	var out []CalibrationIOV
 	for rows.Next() {
-		var iov IOV
-		if err := rows.Scan(&iov.ID, &iov.TagID, &iov.TagName, &iov.ChannelID, &iov.PayloadID,
+		var iov CalibrationIOV
+		if err := rows.Scan(&iov.ID, &iov.LabelID, &iov.Label, &iov.ChannelID, &iov.PayloadID,
 			&iov.Since, &iov.Till, &iov.Revision, &iov.IsActive, &iov.InsertedAt,
 			&iov.InsertedBy, &iov.Comment); err != nil {
 			return nil, fmt.Errorf("scan iov: %w", err)
@@ -227,12 +275,19 @@ func (s *Store) GetHistory(ctx context.Context, tag string, channelID int64) ([]
 }
 
 // CorrectCalibration supersedes any active IOV(s) overlapping [since, till)
-// for a tag+channel with a freshly inserted payload, bumping the revision
+// for a label+channel with a freshly inserted payload, bumping the revision
 // number. Superseded rows are kept (is_active = false) rather than deleted,
 // so past reads remain reproducible.
-func (s *Store) CorrectCalibration(ctx context.Context, tag string, channelID int64, req CorrectCalibrationRequest) (*IOV, error) {
+func (s *Store) CorrectCalibration(ctx context.Context, label string, channelID int64, req CalibrationRequest) (*CalibrationIOV, error) {
+	label, err := normalizeLabel(label)
+	if err != nil {
+		return nil, err
+	}
+	if len(req.Data) == 0 {
+		return nil, fmt.Errorf("%w: data must not be empty", ErrInvalidData)
+	}
 	if req.Since >= req.Till {
-		return nil, fmt.Errorf("since (%d) must be < till (%d)", req.Since, req.Till)
+		return nil, fmt.Errorf("%w: since (%d) must be < till (%d)", ErrInvalidData, req.Since, req.Till)
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -241,12 +296,12 @@ func (s *Store) CorrectCalibration(ctx context.Context, tag string, channelID in
 	}
 	defer tx.Rollback()
 
-	var tagID int64
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM tags WHERE name = $1`, tag).Scan(&tagID); err != nil {
+	var labelID int64
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM tags WHERE name = $1`, label).Scan(&labelID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
-		return nil, fmt.Errorf("lookup tag: %w", err)
+		return nil, fmt.Errorf("lookup label: %w", err)
 	}
 
 	// Deactivate any active IOVs whose validity overlaps the new interval,
@@ -256,7 +311,7 @@ func (s *Store) CorrectCalibration(ctx context.Context, tag string, channelID in
 		WHERE tag_id = $1 AND channel_id = $2 AND is_active
 		  AND validity && int8range($3, $4, '[)')
 		RETURNING revision`,
-		tagID, channelID, req.Since, req.Till,
+		labelID, channelID, req.Since, req.Till,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("deactivate overlapping iovs: %w", err)
@@ -280,19 +335,19 @@ func (s *Store) CorrectCalibration(ctx context.Context, tag string, channelID in
 	var payloadID int64
 	if err := tx.QueryRowContext(ctx,
 		`INSERT INTO payloads (tag_id, data, checksum) VALUES ($1, $2, $3) RETURNING id`,
-		tagID, []byte(req.Data), checksum(req.Data),
+		labelID, []byte(req.Data), checksum(req.Data),
 	).Scan(&payloadID); err != nil {
 		return nil, fmt.Errorf("insert payload: %w", err)
 	}
 
-	var iov IOV
+	var iov CalibrationIOV
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO iovs (tag_id, channel_id, payload_id, since, till, revision, inserted_by, comment)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING id, tag_id, channel_id, payload_id, since, till, revision,
 		          is_active, inserted_at, coalesce(inserted_by, ''), coalesce(comment, '')`,
-		tagID, channelID, payloadID, req.Since, req.Till, maxRevision+1, req.InsertedBy, req.Comment,
-	).Scan(&iov.ID, &iov.TagID, &iov.ChannelID, &iov.PayloadID, &iov.Since, &iov.Till,
+		labelID, channelID, payloadID, req.Since, req.Till, maxRevision+1, req.InsertedBy, req.Comment,
+	).Scan(&iov.ID, &iov.LabelID, &iov.ChannelID, &iov.PayloadID, &iov.Since, &iov.Till,
 		&iov.Revision, &iov.IsActive, &iov.InsertedAt, &iov.InsertedBy, &iov.Comment)
 	if err != nil {
 		if isExclusionViolation(err) {
@@ -304,7 +359,7 @@ func (s *Store) CorrectCalibration(ctx context.Context, tag string, channelID in
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit: %w", err)
 	}
-	iov.TagName = tag
+	iov.Label = label
 	return &iov, nil
 }
 
@@ -322,4 +377,41 @@ func (s *Store) DeactivateIOV(ctx context.Context, id int64) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// DeactivateLabel soft-deletes every active IOV for a label, optionally
+// scoped to a single channel, in one call. It returns the number of IOVs
+// deactivated. As with DeactivateIOV, rows are kept (is_active = false),
+// not deleted, so history/audit queries still see them. Returns
+// ErrNotFound if the label itself doesn't exist.
+func (s *Store) DeactivateLabel(ctx context.Context, label string, channelID *int64) (int64, error) {
+	label, err := normalizeLabel(label)
+	if err != nil {
+		return 0, err
+	}
+
+	var labelID int64
+	if err := s.db.QueryRowContext(ctx, `SELECT id FROM tags WHERE name = $1`, label).Scan(&labelID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, fmt.Errorf("lookup label: %w", err)
+	}
+
+	query := `UPDATE iovs SET is_active = false WHERE tag_id = $1 AND is_active`
+	args := []interface{}{labelID}
+	if channelID != nil {
+		query += ` AND channel_id = $2`
+		args = append(args, *channelID)
+	}
+
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("deactivate label: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("rows affected: %w", err)
+	}
+	return n, nil
 }

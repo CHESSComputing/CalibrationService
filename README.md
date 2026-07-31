@@ -5,32 +5,7 @@ well-defined intervals of validity (IOV), in the spirit of CLEO3 constants
 or CMS conditions data.
 
 ## DB Backend
-we use PostgreSQL DB backend for the following reasons:
-
-- **Range types + exclusion constraints.** `iovs.validity` is an `int8range`
-  generated column, guarded by a `GiST` `EXCLUDE` constraint
-  (`tag_id`, `channel_id`, `validity &&`). The database itself refuses to let
-  two *active* IOVs for the same tag+channel overlap — this is not
-  re-implemented in Go, so there's no race window between "check" and
-  "insert."
-- **ACID transactions.** Every write (new payload + new IOV, or a
-  correction that deactivates old IOVs and inserts a new one) happens in a
-  single transaction, so readers never see a payload without its IOV or a
-  half-applied correction.
-- **JSONB payloads.** The calibration/config blob itself (`payloads.data`)
-  is schema-flexible JSONB, so different detector subsystems can store
-  differently-shaped constants without a schema migration, while the IOV
-  bookkeeping around it stays fully relational and indexable.
-
-`since`/`till` are plain `BIGINT`, so a tag can use either run numbers or
-Unix timestamps depending on subsystem convention. Validity is half-open:
-`[since, till)`.
-
-Corrections never delete data: superseding an IOV sets `is_active = false`
-on the old row and inserts a new payload + IOV with an incremented
-`revision`. `GET /calibrations/:tag/history` returns the full series, so a
-query like "what did we believe the tracker alignment was for run 12345 as
-of last Tuesday" stays answerable.
+we use PostgreSQL DB backend for storing calibration constants
 
 ## Running it
 
@@ -74,71 +49,138 @@ psql "postgres://foxden:foxden@localhost:5432/foxden_calib" -f schema.sql
 # 3. fetch deps and run
 go mod tidy
 CALIB_DB_DSN="postgres://foxden:foxden@localhost:5432/foxden_calib?sslmode=disable" \
-CALIB_ADDR=":8888" \
+CALIB_ADDR=":8399" \
 go run .
 ```
 
 ## API
 
-### Create a calibration
-```
-POST /calibrations
-{
-  "tag": "tracker-alignment",
-  "channel_id": 12,
-  "since": 100000,
-  "till":  105000,
-  "data": {"dx": 0.012, "dy": -0.004, "dz": 0.0},
-  "inserted_by": "alice",
-  "comment": "initial alignment from cosmic run"
-}
-```
-`201 Created` with the new IOV. `409 Conflict` if it overlaps an existing
-active IOV for that tag+channel.
+| Action              | URI Path           |
+|---------------------|--------------------|
+| Create              | `""`               |
+| List                | `/label/*label`    |
+| Valid-at lookup     | `/valid/*label`    |
+| History             | `/history/*label`  |
+| Correct             | `/correct/*label`  |
+| Delete IOV          | `/iov/:id`         |
+| Delete by label     | `/label/*label`    |
 
-### Resolve the calibration valid at a given run/time
-```
-GET /calibrations/tracker-alignment/valid?at=102000&channel_id=12
-```
-Returns the IOV plus its payload, or `404` if nothing is active there.
 
-### List active IOVs for a tag
-```
-GET /calibrations/tracker-alignment?channel_id=12
+where `{label}` is the full hierarchical path, e.g.
+`/calibrations/valid/3b/btr123/cycle123/sampleName?at=102000`.
+
+
+
+### Example: creating a calibration from `calib.yaml`
+Here is an example of using CHAP calibration detector constants:
+
+```yaml
+# request.yaml
+label: /3b/btr123/cycle123/sampleName
+channel_id: 0
+since: 100000
+till: 105000
+inserted_by: alice
+comment: initial eta mapping
+data:
+  detectors:
+  - id: 0
+    attrs:
+      eta: -180.0
+  - id: 1
+    attrs:
+      eta: -171.8181818181818
+  # ... (rest of calib.yaml's detectors list)
 ```
 
-### Full revision history (including superseded IOVs)
+```bash
+curl -X POST http://localhost:8399 \
+  -H "Content-Type: application/x-yaml" \
+  --data-binary @request.yaml
 ```
-GET /calibrations/tracker-alignment/history?channel_id=12
+
+The response comes back as YAML too (Content-Type mirroring), e.g.:
+
+```yaml
+id: 1
+label_id: 1
+label: /3b/btr123/cycle123/sampleName
+channel_id: 0
+payload_id: 1
+since: 100000
+till: 105000
+revision: 1
+is_active: true
+inserted_at: 2026-07-31T12:00:00Z
+inserted_by: alice
+comment: initial eta mapping
+```
+
+The same request works as JSON with `Content-Type: application/json` and a
+JSON body — the envelope fields and nested `data` structure are identical,
+just serialized differently.
+
+## Server end-point reference
+
+```
+POST                             create (label in body)
+GET    /label/{label}?channel_id= list active IOVs for a label
+GET    /valid/{label}?at=&channel_id=  resolve constants valid at a run/time
+GET    /history/{label}?channel_id=    full revision history
+PUT    /correct/{label}?channel_id=    supersede overlapping IOV(s)
+DELETE /iov/{id}                  retract a single IOV
+DELETE /label/{label}?channel_id= retract every active IOV for a label
+```
+
+`{label}` is the full hierarchical path, e.g.
+`/valid/3b/btr123/cycle123/sampleName?at=102000`.
+
+Add `Content-Type: application/x-yaml` (request) and/or `Accept:
+application/x-yaml` / `?format=yaml` (response) to any of the above to use
+YAML instead of JSON.
+
+### Resolve the calibration valid at a given run/time (YAML response)
+```
+GET /valid/3b/btr123/cycle123/sampleName?at=102000&format=yaml
+```
+
+### List active IOVs for a label (JSON, default)
+```
+GET /label/3b/btr123/cycle123/sampleName?channel_id=0
 ```
 
 ### Correct/replace a range
 ```
-PUT /calibrations/tracker-alignment/correct?channel_id=12
+PUT /correct/3b/btr123/cycle123/sampleName?channel_id=0
+Content-Type: application/json
 {
   "since": 100000,
   "till":  105000,
-  "data": {"dx": 0.011, "dy": -0.0038, "dz": 0.0},
+  "data": {"detectors": [...]},
   "inserted_by": "bob",
   "comment": "reprocessed with better cosmic sample"
 }
 ```
-Deactivates any active IOV(s) overlapping `[since, till)` for that
-tag+channel and inserts a new payload+IOV at `revision+1`.
 
-### Retract a single IOV
+### Deleting
+
+`{id}` in `DELETE /calibrations/iov/{id}` is the primary key of a single
+**IOV row** — one specific `(label, channel, since, till, revision)`
+validity interval — not the label and not the payload. You get it back in
+the `id` field of every create/list/valid/history/correct response. This
+retracts exactly that one interval:
+
+```bash
+curl -X DELETE http://localhost:8399/iov/17
+# -> 204 No Content
 ```
-DELETE /calibrations/iov/{id}
+
+To retract *every* active interval for a label in one call (optionally
+scoped to a channel), use the new bulk endpoint instead:
+
+```bash
+curl -X DELETE "http://localhost:8399/label/3b/btr123/cycle123/sampleName?channel_id=0"
 ```
-Soft-deletes (`is_active = false`); the row and its payload remain for
-history.
-
-## Notes / extension points
-
-- `channel_id` defaults to `0` for tags that don't need per-channel
-  granularity (e.g. a single global run-conditions tag).
-- Add auth/middleware (FOXDEN's existing token/scope layer) in `main.go`
-  before `NewHandler(store).RegisterRoutes(r)`.
-- If you need range-overlap listing (e.g. "all IOVs touching runs
-  100000-110000") that's a straightforward addition to `db.go` using
-  `validity && int8range($1, $2, '[)')`.
+```json
+{"label": "/3b/btr123/cycle123/sampleName", "channel_id": 0, "deactivated": 3}
+```
