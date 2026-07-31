@@ -21,11 +21,11 @@ func setupRouter(store *Store) *gin.Engine {
 	routes := []server.Route{
 		{Method: "POST", Path: "", Handler: h.CreateCalibration, Authorized: true, Scope: "write"},
 		{Method: "GET", Path: "/label/*label", Handler: h.ListCalibrations, Authorized: false, Scope: "read"},
-		{Method: "GET", Path: "/valid/*label", Handler: h.GetValidCalibration, Authorized: true, Scope: "write"},
-		{Method: "GET", Path: "/history/*label", Handler: h.GetHistory, Authorized: true, Scope: "write"},
+		{Method: "GET", Path: "/valid/*label", Handler: h.GetValidCalibration, Authorized: true, Scope: "read"},
+		{Method: "GET", Path: "/history/*label", Handler: h.GetHistory, Authorized: true, Scope: "read"},
 		{Method: "PUT", Path: "/correct/*label", Handler: h.CorrectCalibration, Authorized: true, Scope: "write"},
-		{Method: "DELETE", Path: "/iov/:id", Handler: h.DeleteIOV, Authorized: true, Scope: "read"},
-		{Method: "DELETE", Path: "/label/*label", Handler: h.DeleteByLabel, Authorized: true, Scope: "write"},
+		{Method: "DELETE", Path: "/iov/:id", Handler: h.DeleteIOV, Authorized: true, Scope: "delete"},
+		{Method: "DELETE", Path: "/label/*label", Handler: h.DeleteByLabel, Authorized: true, Scope: "delete"},
 	}
 	r := server.Router(routes, nil, "static", srvConfig.Config.CalibrationData.WebServer)
 	return r
