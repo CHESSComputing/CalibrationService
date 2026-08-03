@@ -156,6 +156,9 @@ func (h *Handler) CreateCalibration(c *gin.Context) {
 }
 
 // GET /calibrations/valid/*label?at=<run_or_ts>&channel_id=<id>
+// "at" is optional: if omitted, resolves to the current default - the
+// active IOV with the greatest since overall (i.e. the most recent one,
+// which stays in effect until overwritten).
 func (h *Handler) GetValidCalibration(c *gin.Context) {
 	label, err := labelParam(c)
 	if err != nil {
@@ -163,10 +166,14 @@ func (h *Handler) GetValidCalibration(c *gin.Context) {
 		return
 	}
 
-	at, err := strconv.ParseInt(c.Query("at"), 10, 64)
-	if err != nil {
-		writeErr(c, fmt.Errorf("%w: query param 'at' is required and must be an integer (run number or unix timestamp)", ErrInvalidData))
-		return
+	var at *int64
+	if v := c.Query("at"); v != "" {
+		parsed, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			writeErr(c, fmt.Errorf("%w: query param 'at' must be an integer (run number or unix timestamp)", ErrInvalidData))
+			return
+		}
+		at = &parsed
 	}
 	channelID, err := strconv.ParseInt(c.DefaultQuery("channel_id", "0"), 10, 64)
 	if err != nil {
@@ -309,7 +316,7 @@ func writeErr(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, ErrNotFound), errors.Is(err, sql.ErrNoRows):
 		render(c, http.StatusNotFound, gin.H{"error": err.Error()})
-	case errors.Is(err, ErrOverlap):
+	case errors.Is(err, ErrDuplicateSince):
 		render(c, http.StatusConflict, gin.H{"error": err.Error()})
 	case errors.Is(err, ErrInvalidData):
 		render(c, http.StatusBadRequest, gin.H{"error": err.Error()})

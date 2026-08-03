@@ -17,9 +17,12 @@ import (
 
 // Sentinel errors surfaced to the handler layer.
 var (
-	ErrOverlap     = errors.New("interval of validity overlaps an existing active IOV for this label/channel")
-	ErrNotFound    = errors.New("not found")
-	ErrInvalidData = errors.New("invalid request")
+	// ErrDuplicateSince is returned when inserting an IOV whose (label,
+	// channel, since) matches an already-active row. Use the correct
+	// endpoint to overwrite an existing since point instead.
+	ErrDuplicateSince = errors.New("an active IOV already exists at this since for this label/channel; use the correct endpoint to overwrite it")
+	ErrNotFound       = errors.New("not found")
+	ErrInvalidData    = errors.New("invalid request")
 )
 
 // Store wraps a database/sql handle with the calibration-specific queries.
@@ -52,12 +55,13 @@ func checksum(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// isExclusionViolation reports whether err is a Postgres exclusion-constraint
-// violation (SQLSTATE 23P01) - i.e. the "no_overlap" constraint on iovs fired.
-func isExclusionViolation(err error) bool {
+// isUniqueViolation reports whether err is a Postgres unique-constraint
+// violation (SQLSTATE 23505) - i.e. the partial unique index that enforces
+// "at most one active IOV per (label, channel, since)" fired.
+func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		return pgErr.Code == "23P01"
+		return pgErr.Code == "23505"
 	}
 	return false
 }
@@ -109,10 +113,12 @@ func (s *Store) GetOrCreateLabel(ctx context.Context, label, description string)
 	return id, nil
 }
 
-// InsertCalibration writes a new payload and a new IOV row for it in a single
-// transaction. The "no_overlap" exclusion constraint on iovs is what actually
-// prevents two active, overlapping validity ranges for the same label+channel;
-// a violation is translated into ErrOverlap.
+// InsertCalibration writes a new payload and a new IOV row for it in a
+// single transaction. The row is valid starting at req.Since and remains
+// the default until a later Since (for the same label+channel) supersedes
+// it - there is no "till". A partial unique index prevents two active rows
+// at the same (label, channel, since); a violation is translated into
+// ErrDuplicateSince (use CorrectCalibration to overwrite that since point).
 func (s *Store) InsertCalibration(ctx context.Context, req CalibrationRequest) (*CalibrationIOV, error) {
 	label, err := normalizeLabel(req.Label)
 	if err != nil {
@@ -120,9 +126,6 @@ func (s *Store) InsertCalibration(ctx context.Context, req CalibrationRequest) (
 	}
 	if len(req.Data) == 0 {
 		return nil, fmt.Errorf("%w: data must not be empty", ErrInvalidData)
-	}
-	if req.Since >= req.Till {
-		return nil, fmt.Errorf("%w: since (%d) must be < till (%d)", ErrInvalidData, req.Since, req.Till)
 	}
 
 	labelID, err := s.GetOrCreateLabel(ctx, label, "")
@@ -147,16 +150,16 @@ func (s *Store) InsertCalibration(ctx context.Context, req CalibrationRequest) (
 
 	var iov CalibrationIOV
 	err = tx.QueryRowContext(ctx, `
-		INSERT INTO iovs (tag_id, channel_id, payload_id, since, till, inserted_by, comment)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		RETURNING id, tag_id, channel_id, payload_id, since, till, revision,
+		INSERT INTO iovs (tag_id, channel_id, payload_id, since, inserted_by, comment)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, tag_id, channel_id, payload_id, since, revision,
 		          is_active, inserted_at, coalesce(inserted_by, ''), coalesce(comment, '')`,
-		labelID, req.ChannelID, payloadID, req.Since, req.Till, req.InsertedBy, req.Comment,
-	).Scan(&iov.ID, &iov.LabelID, &iov.ChannelID, &iov.PayloadID, &iov.Since, &iov.Till,
+		labelID, req.ChannelID, payloadID, req.Since, req.InsertedBy, req.Comment,
+	).Scan(&iov.ID, &iov.LabelID, &iov.ChannelID, &iov.PayloadID, &iov.Since,
 		&iov.Revision, &iov.IsActive, &iov.InsertedAt, &iov.InsertedBy, &iov.Comment)
 	if err != nil {
-		if isExclusionViolation(err) {
-			return nil, ErrOverlap
+		if isUniqueViolation(err) {
+			return nil, ErrDuplicateSince
 		}
 		return nil, fmt.Errorf("insert iov: %w", err)
 	}
@@ -168,27 +171,35 @@ func (s *Store) InsertCalibration(ctx context.Context, req CalibrationRequest) (
 	return &iov, nil
 }
 
-// GetValidCalibration resolves the active IOV (and its payload) for a label +
-// channel whose validity range contains "at" (a run number or timestamp).
-func (s *Store) GetValidCalibration(ctx context.Context, label string, channelID, at int64) (*CalibrationIOV, json.RawMessage, error) {
+// GetValidCalibration resolves the active IOV (and its payload) for a
+// label+channel that is in effect "at" a given run/timestamp - i.e. the
+// active row with the greatest since <= at. If at is nil, it resolves to
+// the current default: the active row with the greatest since overall.
+func (s *Store) GetValidCalibration(ctx context.Context, label string, channelID int64, at *int64) (*CalibrationIOV, json.RawMessage, error) {
 	label, err := normalizeLabel(label)
 	if err != nil {
 		return nil, nil, err
 	}
+	var atArg interface{}
+	if at != nil {
+		atArg = *at
+	}
+
 	var iov CalibrationIOV
 	var data json.RawMessage
 	err = s.db.QueryRowContext(ctx, `
-		SELECT i.id, i.tag_id, t.name, i.channel_id, i.payload_id, i.since, i.till,
+		SELECT i.id, i.tag_id, t.name, i.channel_id, i.payload_id, i.since,
 		       i.revision, i.is_active, i.inserted_at,
 		       coalesce(i.inserted_by, ''), coalesce(i.comment, ''), p.data
 		FROM iovs i
 		JOIN tags t ON t.id = i.tag_id
 		JOIN payloads p ON p.id = i.payload_id
 		WHERE t.name = $1 AND i.channel_id = $2 AND i.is_active
-		  AND i.validity @> $3::bigint
+		  AND ($3::bigint IS NULL OR i.since <= $3::bigint)
+		ORDER BY i.since DESC, i.revision DESC
 		LIMIT 1`,
-		label, channelID, at,
-	).Scan(&iov.ID, &iov.LabelID, &iov.Label, &iov.ChannelID, &iov.PayloadID, &iov.Since, &iov.Till,
+		label, channelID, atArg,
+	).Scan(&iov.ID, &iov.LabelID, &iov.Label, &iov.ChannelID, &iov.PayloadID, &iov.Since,
 		&iov.Revision, &iov.IsActive, &iov.InsertedAt, &iov.InsertedBy, &iov.Comment, &data)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, ErrNotFound
@@ -199,14 +210,16 @@ func (s *Store) GetValidCalibration(ctx context.Context, label string, channelID
 	return &iov, data, nil
 }
 
-// ListCalibrations returns all active IOVs for a label, optionally filtered by channel.
+// ListCalibrations returns all active IOVs for a label, optionally filtered
+// by channel, ordered chronologically. Each row is valid from its Since
+// until the next row's Since (or indefinitely, for the last one).
 func (s *Store) ListCalibrations(ctx context.Context, label string, channelID *int64) ([]CalibrationIOV, error) {
 	label, err := normalizeLabel(label)
 	if err != nil {
 		return nil, err
 	}
 	query := `
-		SELECT i.id, i.tag_id, t.name, i.channel_id, i.payload_id, i.since, i.till,
+		SELECT i.id, i.tag_id, t.name, i.channel_id, i.payload_id, i.since,
 		       i.revision, i.is_active, i.inserted_at,
 		       coalesce(i.inserted_by, ''), coalesce(i.comment, '')
 		FROM iovs i
@@ -229,7 +242,7 @@ func (s *Store) ListCalibrations(ctx context.Context, label string, channelID *i
 	for rows.Next() {
 		var iov CalibrationIOV
 		if err := rows.Scan(&iov.ID, &iov.LabelID, &iov.Label, &iov.ChannelID, &iov.PayloadID,
-			&iov.Since, &iov.Till, &iov.Revision, &iov.IsActive, &iov.InsertedAt,
+			&iov.Since, &iov.Revision, &iov.IsActive, &iov.InsertedAt,
 			&iov.InsertedBy, &iov.Comment); err != nil {
 			return nil, fmt.Errorf("scan iov: %w", err)
 		}
@@ -239,15 +252,16 @@ func (s *Store) ListCalibrations(ctx context.Context, label string, channelID *i
 }
 
 // GetHistory returns every IOV revision (active and superseded) for a
-// label+channel, in validity order - useful for auditing "what did we think
-// the constants were at insert time T", independent of later corrections.
+// label+channel, in chronological order - useful for auditing "what did we
+// think the constants were at insert time T", independent of later
+// corrections.
 func (s *Store) GetHistory(ctx context.Context, label string, channelID int64) ([]CalibrationIOV, error) {
 	label, err := normalizeLabel(label)
 	if err != nil {
 		return nil, err
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT i.id, i.tag_id, t.name, i.channel_id, i.payload_id, i.since, i.till,
+		SELECT i.id, i.tag_id, t.name, i.channel_id, i.payload_id, i.since,
 		       i.revision, i.is_active, i.inserted_at,
 		       coalesce(i.inserted_by, ''), coalesce(i.comment, '')
 		FROM iovs i
@@ -265,7 +279,7 @@ func (s *Store) GetHistory(ctx context.Context, label string, channelID int64) (
 	for rows.Next() {
 		var iov CalibrationIOV
 		if err := rows.Scan(&iov.ID, &iov.LabelID, &iov.Label, &iov.ChannelID, &iov.PayloadID,
-			&iov.Since, &iov.Till, &iov.Revision, &iov.IsActive, &iov.InsertedAt,
+			&iov.Since, &iov.Revision, &iov.IsActive, &iov.InsertedAt,
 			&iov.InsertedBy, &iov.Comment); err != nil {
 			return nil, fmt.Errorf("scan iov: %w", err)
 		}
@@ -274,10 +288,13 @@ func (s *Store) GetHistory(ctx context.Context, label string, channelID int64) (
 	return out, rows.Err()
 }
 
-// CorrectCalibration supersedes any active IOV(s) overlapping [since, till)
-// for a label+channel with a freshly inserted payload, bumping the revision
-// number. Superseded rows are kept (is_active = false) rather than deleted,
-// so past reads remain reproducible.
+// CorrectCalibration overwrites the value at an existing since point: it
+// deactivates the currently-active IOV at (label, channel, req.Since) and
+// inserts a new payload+IOV at the same since with revision+1. Unlike
+// InsertCalibration, this requires a matching active row to already exist
+// (ErrNotFound otherwise) - use POST /calibrations to add a brand new
+// since point instead. Superseded rows are kept (is_active = false), not
+// deleted, so past reads remain reproducible.
 func (s *Store) CorrectCalibration(ctx context.Context, label string, channelID int64, req CalibrationRequest) (*CalibrationIOV, error) {
 	label, err := normalizeLabel(label)
 	if err != nil {
@@ -285,9 +302,6 @@ func (s *Store) CorrectCalibration(ctx context.Context, label string, channelID 
 	}
 	if len(req.Data) == 0 {
 		return nil, fmt.Errorf("%w: data must not be empty", ErrInvalidData)
-	}
-	if req.Since >= req.Till {
-		return nil, fmt.Errorf("%w: since (%d) must be < till (%d)", ErrInvalidData, req.Since, req.Till)
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -304,32 +318,18 @@ func (s *Store) CorrectCalibration(ctx context.Context, label string, channelID 
 		return nil, fmt.Errorf("lookup label: %w", err)
 	}
 
-	// Deactivate any active IOVs whose validity overlaps the new interval,
-	// tracking the highest revision seen so the new row continues the series.
-	rows, err := tx.QueryContext(ctx, `
+	var oldRevision int
+	err = tx.QueryRowContext(ctx, `
 		UPDATE iovs SET is_active = false
-		WHERE tag_id = $1 AND channel_id = $2 AND is_active
-		  AND validity && int8range($3, $4, '[)')
+		WHERE tag_id = $1 AND channel_id = $2 AND since = $3 AND is_active
 		RETURNING revision`,
-		labelID, channelID, req.Since, req.Till,
-	)
+		labelID, channelID, req.Since,
+	).Scan(&oldRevision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: no active IOV at since=%d for this label/channel to correct", ErrNotFound, req.Since)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("deactivate overlapping iovs: %w", err)
-	}
-	maxRevision := 0
-	for rows.Next() {
-		var rev int
-		if err := rows.Scan(&rev); err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("scan revision: %w", err)
-		}
-		if rev > maxRevision {
-			maxRevision = rev
-		}
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate revisions: %w", err)
+		return nil, fmt.Errorf("deactivate existing iov: %w", err)
 	}
 
 	var payloadID int64
@@ -342,16 +342,16 @@ func (s *Store) CorrectCalibration(ctx context.Context, label string, channelID 
 
 	var iov CalibrationIOV
 	err = tx.QueryRowContext(ctx, `
-		INSERT INTO iovs (tag_id, channel_id, payload_id, since, till, revision, inserted_by, comment)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		RETURNING id, tag_id, channel_id, payload_id, since, till, revision,
+		INSERT INTO iovs (tag_id, channel_id, payload_id, since, revision, inserted_by, comment)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, tag_id, channel_id, payload_id, since, revision,
 		          is_active, inserted_at, coalesce(inserted_by, ''), coalesce(comment, '')`,
-		labelID, channelID, payloadID, req.Since, req.Till, maxRevision+1, req.InsertedBy, req.Comment,
-	).Scan(&iov.ID, &iov.LabelID, &iov.ChannelID, &iov.PayloadID, &iov.Since, &iov.Till,
+		labelID, channelID, payloadID, req.Since, oldRevision+1, req.InsertedBy, req.Comment,
+	).Scan(&iov.ID, &iov.LabelID, &iov.ChannelID, &iov.PayloadID, &iov.Since,
 		&iov.Revision, &iov.IsActive, &iov.InsertedAt, &iov.InsertedBy, &iov.Comment)
 	if err != nil {
-		if isExclusionViolation(err) {
-			return nil, ErrOverlap
+		if isUniqueViolation(err) {
+			return nil, ErrDuplicateSince
 		}
 		return nil, fmt.Errorf("insert iov: %w", err)
 	}

@@ -2,19 +2,23 @@
 --
 -- Model:
 --   tags     -- a named calibration/configuration set, e.g. "tracker-alignment"
+--              (API-facing name: "label", see db.go/handlers.go)
 --   payloads -- the actual JSONB constants blob, versioned/immutable once written
---   iovs     -- interval-of-validity rows: (tag, channel, since, till) -> payload
+--   iovs     -- IOV rows: (tag, channel, since) -> payload
 --
--- "since"/"till" are plain BIGINT so you can use either run numbers or unix
--- timestamps (seconds) depending on the detector subsystem's convention.
--- "till" is exclusive, i.e. validity = [since, till).
+-- There is no "till". Each row is valid starting at "since" (a run number
+-- or unix timestamp) and remains in effect until a later "since" (for the
+-- same tag+channel) supersedes it. In other words: the calibration in
+-- effect at any point in time is the active row with the greatest
+-- since <= that point - the most recently started entry always wins. If
+-- no "at" point is given, that's just the active row with the greatest
+-- since overall, i.e. "the last one is the default until it's overwritten."
 --
--- The EXCLUDE USING gist constraint on iovs guarantees, at the database level,
--- that no two *active* IOVs for the same (tag, channel) can have overlapping
--- validity ranges. This is the key correctness property CLEO3/CMS-style
--- conditions databases rely on.
-
-CREATE EXTENSION IF NOT EXISTS btree_gist;
+-- A partial UNIQUE index guarantees, at the database level, that no two
+-- *active* rows for the same (tag, channel) share the same since - so
+-- "the active row with the greatest since" is always unambiguous. This
+-- replaces the old EXCLUDE USING gist overlap constraint, which is no
+-- longer needed now that there's no "till" range to overlap.
 
 CREATE TABLE IF NOT EXISTS tags (
     id          BIGSERIAL PRIMARY KEY,
@@ -36,25 +40,19 @@ CREATE TABLE IF NOT EXISTS iovs (
     tag_id      BIGINT NOT NULL REFERENCES tags(id) ON DELETE RESTRICT,
     channel_id  BIGINT NOT NULL DEFAULT 0,     -- e.g. detector module/crate/channel; 0 = global
     payload_id  BIGINT NOT NULL REFERENCES payloads(id) ON DELETE RESTRICT,
-    since       BIGINT NOT NULL,               -- inclusive: run number or unix ts
-    till        BIGINT NOT NULL,               -- exclusive
-    validity    INT8RANGE GENERATED ALWAYS AS (int8range(since, till, '[)')) STORED,
+    since       BIGINT NOT NULL,               -- run number or unix ts; valid from here until superseded
     revision    INT NOT NULL DEFAULT 1,        -- bumped on correction, old row deactivated
-    is_active   BOOLEAN NOT NULL DEFAULT TRUE, -- false = superseded, kept for history/reproducibility
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE, -- false = superseded/retracted, kept for history
     inserted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     inserted_by TEXT,
-    comment     TEXT,
-
-    CONSTRAINT since_before_till CHECK (since < till),
-
-    -- Core correctness guarantee: no two ACTIVE IOVs for the same tag+channel
-    -- may have overlapping validity ranges.
-    CONSTRAINT no_overlap EXCLUDE USING gist (
-        tag_id     WITH =,
-        channel_id WITH =,
-        validity   WITH &&
-    ) WHERE (is_active)
+    comment     TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_iovs_tag_channel ON iovs (tag_id, channel_id);
+-- Core correctness guarantee: at most one ACTIVE row per (tag, channel,
+-- since), so "the active row with the greatest since" is always
+-- well-defined and there's no ambiguity about which entry is current.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_iovs_unique_active_since
+    ON iovs (tag_id, channel_id, since) WHERE (is_active);
+
+CREATE INDEX IF NOT EXISTS idx_iovs_tag_channel_since ON iovs (tag_id, channel_id, since DESC);
 CREATE INDEX IF NOT EXISTS idx_payloads_tag ON payloads (tag_id);

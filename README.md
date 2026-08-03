@@ -70,6 +70,22 @@ where `{label}` is the full hierarchical path, e.g.
 `/calibrations/valid/3b/btr123/cycle123/sampleName?at=102000`.
 
 
+## Interval of validity (IOV)
+
+An IOV now has only `since` — no `till`. A row is valid starting at
+`since` and stays in effect **until a later `since` (for the same
+label+channel) supersedes it**. There's no explicit end date to set or
+maintain:
+
+```
+channel's timeline:  since=100000 ────────► since=105000 ────────►
+                      (payload A)            (payload B)   ... still current
+```
+
+- Payload A is "valid" for any `at >= 100000` up until `at >= 105000`, at
+  which point payload B takes over.
+- Whatever has the **greatest active `since`** is always the current
+  default — exactly "the last one is used until it's overwritten."
 
 ### Example: creating a calibration from `calib.yaml`
 Here is an example of using CHAP calibration detector constants:
@@ -79,7 +95,6 @@ Here is an example of using CHAP calibration detector constants:
 label: /3b/btr123/cycle123/sampleName
 channel_id: 0
 since: 100000
-till: 105000
 inserted_by: alice
 comment: initial eta mapping
 data:
@@ -108,7 +123,6 @@ label: /3b/btr123/cycle123/sampleName
 channel_id: 0
 payload_id: 1
 since: 100000
-till: 105000
 revision: 1
 is_active: true
 inserted_at: 2026-07-31T12:00:00Z
@@ -139,13 +153,15 @@ Add `Content-Type: application/x-yaml` (request) and/or `Accept:
 application/x-yaml` / `?format=yaml` (response) to any of the above to use
 YAML instead of JSON.
 
-### Resolve the calibration valid at a given run/time (YAML response)
+### `GET /valid/{label}` API
+
 ```
+# Resolve the calibration valid at a given run/time (YAML response)
 GET /valid/3b/btr123/cycle123/sampleName?at=102000&format=yaml
 ```
 
-### List active IOVs for a label (JSON, default)
 ```
+# List active IOVs for a label (JSON, default)
 GET /label/3b/btr123/cycle123/sampleName?channel_id=0
 ```
 
@@ -155,17 +171,61 @@ PUT /correct/3b/btr123/cycle123/sampleName?channel_id=0
 Content-Type: application/json
 {
   "since": 100000,
-  "till":  105000,
   "data": {"detectors": [...]},
   "inserted_by": "bob",
   "comment": "reprocessed with better cosmic sample"
 }
 ```
 
-### Deleting
+
+Previously `at` was required. Now, omitting it resolves to the current
+default (the active row with the greatest `since`):
+
+```bash
+# what's the calibration in effect right now?
+curl "http://localhost:8399/valid/3b/btr123/cycle123/sampleName"
+
+# what was it at run 102000?
+curl "http://localhost:8399/valid/3b/btr123/cycle123/sampleName?at=102000"
+```
+
+### `POST /` API to add a new since point
+
+To add new calibration constants please use the following syntax
+
+```bash
+curl -X POST http://localhost:8399 \
+  -H "Content-Type: application/json" \
+  -d '{"label": "/3b/btr123/cycle123/sampleName", "channel_id": 0,
+       "since": 105000, "data": {"dx": 0.011}, "inserted_by": "bob"}'
+```
+
+If an *active* row already exists at that exact `(label, channel, since)`,
+this now returns `409 Conflict` with `ErrDuplicateSince` (renamed from
+`ErrOverlap`, since there's no range to overlap anymore) you
+may use `PUT /correct/{label}` instead to overwrite it.
+
+### `PUT /correct/{label}` API to overwrites an existing since point
+
+It overwrites the **exact** `since` you pass — it requires an active row
+already at that `since` (`404` if not, with a message telling you there's
+nothing there to correct), deactivates it, and inserts a new payload/IOV at the
+same `since` with `revision + 1`:
+
+```bash
+curl -X PUT "http://localhost:8399/correct/3b/btr123/cycle123/sampleName?channel_id=0" \
+  -H "Content-Type: application/json" \
+  -d '{"since": 100000, "data": {"dx": 0.0112}, "inserted_by": "bob",
+       "comment": "fixed a typo in the original entry"}'
+```
+
+Use `POST` to add a new time period; use `PUT .../correct` to fix a mistake
+in an existing one.
+
+### `DELETE /iov/{id}` API to delete given IOV
 
 `{id}` in `DELETE /calibrations/iov/{id}` is the primary key of a single
-**IOV row** — one specific `(label, channel, since, till, revision)`
+**IOV row** — one specific `(label, channel, since, revision)`
 validity interval — not the label and not the payload. You get it back in
 the `id` field of every create/list/valid/history/correct response. This
 retracts exactly that one interval:

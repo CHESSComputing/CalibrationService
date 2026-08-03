@@ -5,47 +5,22 @@ import (
 	"time"
 )
 
-// Payload is an immutable, versioned constants blob for a tag.
-type Payload struct {
-	ID        int64           `json:"id"`
-	TagID     int64           `json:"tag_id"`
-	Data      json.RawMessage `json:"data"`
-	Checksum  string          `json:"checksum"`
-	CreatedAt time.Time       `json:"created_at"`
-}
-
-// IOV (interval of validity) binds a payload to a tag+channel for a
-// half-open range [Since, Till).
-type IOV struct {
-	ID         int64     `json:"id"`
-	TagID      int64     `json:"tag_id"`
-	TagName    string    `json:"tag_name,omitempty"`
-	ChannelID  int64     `json:"channel_id"`
-	PayloadID  int64     `json:"payload_id"`
-	Since      int64     `json:"since"`
-	Till       int64     `json:"till"`
-	Revision   int       `json:"revision"`
-	IsActive   bool      `json:"is_active"`
-	InsertedAt time.Time `json:"inserted_at"`
-	InsertedBy string    `json:"inserted_by,omitempty"`
-	Comment    string    `json:"comment,omitempty"`
-}
-
 // CalibrationRequest is the payload for creating a new calibration (POST)
 // and for corrections (PUT). Label uses a hierarchical path, e.g.
-// "/3b/btr123/cycle123/sampleName".
+// "/3b/btr123/cycle123/sampleName". There is no "till": the row is valid
+// from Since onward until a later Since (for the same label+channel)
+// supersedes it - the most recently started entry is always the default.
 type CalibrationRequest struct {
 	Label      string          `json:"label"`
 	ChannelID  int64           `json:"channel_id"`
 	Since      int64           `json:"since"`
-	Till       int64           `json:"till"`
 	Data       json.RawMessage `json:"data"`
 	InsertedBy string          `json:"inserted_by,omitempty"`
 	Comment    string          `json:"comment,omitempty"`
 }
 
-// CalibrationIOV (interval of validity) binds a payload to a label+channel
-// for a half-open range [Since, Till).
+// CalibrationIOV binds a payload to a label+channel starting at Since, with
+// no explicit end - it remains in effect until a later Since supersedes it.
 type CalibrationIOV struct {
 	ID         int64     `json:"id"`
 	LabelID    int64     `json:"label_id"`
@@ -53,7 +28,6 @@ type CalibrationIOV struct {
 	ChannelID  int64     `json:"channel_id"`
 	PayloadID  int64     `json:"payload_id"`
 	Since      int64     `json:"since"`
-	Till       int64     `json:"till"`
 	Revision   int       `json:"revision"`
 	IsActive   bool      `json:"is_active"`
 	InsertedAt time.Time `json:"inserted_at"`
@@ -67,4 +41,3 @@ type CalibrationResponse struct {
 	IOV     CalibrationIOV  `json:"iov"`
 	Payload json.RawMessage `json:"payload"`
 }
-
