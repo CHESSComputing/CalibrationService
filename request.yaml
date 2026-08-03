@@ -2,7 +2,6 @@
 label: /3b/btr123/cycle123/sampleName
 channel_id: 0
 since: 100000
-till: 105000
 inserted_by: vk
 comment: initial eta mapping
 data:
