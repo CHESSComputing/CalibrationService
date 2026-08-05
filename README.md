@@ -5,77 +5,52 @@ well-defined intervals of validity (IOV), in the spirit of CLEO3 constants
 or CMS conditions data.
 
 ## DB Backend
-we use PostgreSQL DB backend for storing calibration constants
+
+We use a PostgreSQL backend for storing calibration constants.
 
 ## Running it
 
-Install and manage your PostgresDB, e.g.
 ```bash
-# pull out docker image
+# pull the image
 docker pull postgres:17
 
-# run pdb
+# run Postgres
 docker run -d \
-  --name postgres17 \
-  -e POSTGRES_USER=postgres \
-  -e POSTGRES_PASSWORD=secret \
-  -e POSTGRES_DB=testdb \
+  --name foxden-calib-pg \
+  -e POSTGRES_USER=foxden \
+  -e POSTGRES_PASSWORD=foxden \
+  -e POSTGRES_DB=foxden_calib \
   -p 5432:5432 \
-  -v postgres-data:/var/lib/postgresql/data \
+  -v foxden-calib-pg-data:/var/lib/postgresql/data \
   postgres:17
 
-# access db
-docker exec -it postgres17 psql -U postgres -d testdb
+# load the schema
+cat static/schema/schema.sql | docker exec -i foxden-calib-pg psql -U foxden -d foxden_calib
 
-# create schema
-cat static/schema/schema.sql | docker exec -i postgres17 psql -U postgres -d testdb
+# (existing database only: also run the till-removal migration once)
+# cat static/schema/migration_remove_till.sql | docker exec -i foxden-calib-pg psql -U foxden -d foxden_calib
 
-# usefull commands
-docker logs postgres17
-docker stop postgres17
-docker start postgres17
-docker rm -f postgres17
-```
-
-```bash
-# 1. start Postgres (any 14+ works; needs btree_gist, created by schema.sql)
-docker run -d --name foxden-calib-pg -e POSTGRES_USER=foxden \
-  -e POSTGRES_PASSWORD=foxden -e POSTGRES_DB=foxden_calib \
-  -p 5432:5432 postgres:16
-
-# 2. load the schema
-psql "postgres://foxden:foxden@localhost:5432/foxden_calib" -f schema.sql
-
-# 3. fetch deps and run
+# fetch deps and run the service
 go mod tidy
 CALIB_DB_DSN="postgres://foxden:foxden@localhost:5432/foxden_calib?sslmode=disable" \
 CALIB_ADDR=":8399" \
 go run .
 ```
 
-## API
-
-| Action              | URI Path           |
-|---------------------|--------------------|
-| Create              | `""`               |
-| List                | `/label/*label`    |
-| Valid-at lookup     | `/valid/*label`    |
-| History             | `/history/*label`  |
-| Correct             | `/correct/*label`  |
-| Delete IOV          | `/iov/:id`         |
-| Delete by label     | `/label/*label`    |
-
-
-where `{label}` is the full hierarchical path, e.g.
-`/calibrations/valid/3b/btr123/cycle123/sampleName?at=102000`.
-
+Useful Docker commands:
+```bash
+docker exec -it foxden-calib-pg psql -U foxden -d foxden_calib
+docker logs foxden-calib-pg
+docker stop foxden-calib-pg
+docker start foxden-calib-pg
+docker rm -f foxden-calib-pg
+```
 
 ## Interval of validity (IOV)
 
-An IOV now has only `since` — no `till`. A row is valid starting at
-`since` and stays in effect **until a later `since` (for the same
-label+channel) supersedes it**. There's no explicit end date to set or
-maintain:
+An IOV has only `since` — no `till`. A row is valid starting at `since`
+and stays in effect **until a later `since` (for the same label+channel)
+supersedes it**. There's no explicit end date to set or maintain:
 
 ```
 channel's timeline:  since=100000 ────────► since=105000 ────────►
@@ -87,7 +62,29 @@ channel's timeline:  since=100000 ────────► since=105000 ─�
 - Whatever has the **greatest active `since`** is always the current
   default — exactly "the last one is used until it's overwritten."
 
-### Example: creating a calibration from `calib.yaml`
+## API reference
+
+| Method | Path              | Action                                        |
+|--------|-------------------|------------------------------------------------|
+| POST   | `""`              | Create (label in body)                         |
+| GET    | `/label/*label`   | List active IOVs for a label                    |
+| GET    | `/valid/*label`   | Resolve constants valid at a run/time (or the current default if `at` is omitted) |
+| GET    | `/history/*label` | Full revision history                           |
+| PUT    | `/correct/*label` | Overwrite an existing `since` point             |
+| DELETE | `/iov/:id`        | Retract a single IOV                            |
+| DELETE | `/label/*label`   | Retract every active IOV for a label            |
+
+`{label}` is the full hierarchical path, e.g.
+`/valid/3b/btr123/cycle123/sampleName?at=102000`. Note that List and
+"Delete by label" share the same path — they're distinguished by HTTP
+method (`GET` vs `DELETE`), not by URL.
+
+Add `Content-Type: application/x-yaml` (request) and/or `Accept:
+application/x-yaml` / `?format=yaml` (response) to any of the above to use
+YAML instead of JSON.
+
+## Example: creating a calibration from `calib.yaml`
+
 Here is an example of using CHAP calibration detector constants:
 
 ```yaml
@@ -134,65 +131,33 @@ The same request works as JSON with `Content-Type: application/json` and a
 JSON body — the envelope fields and nested `data` structure are identical,
 just serialized differently.
 
-## Server end-point reference
+## Endpoint examples
 
-```
-POST                             create (label in body)
-GET    /label/{label}?channel_id= list active IOVs for a label
-GET    /valid/{label}?at=&channel_id=  resolve constants valid at a run/time
-GET    /history/{label}?channel_id=    full revision history
-PUT    /correct/{label}?channel_id=    supersede overlapping IOV(s)
-DELETE /iov/{id}                  retract a single IOV
-DELETE /label/{label}?channel_id= retract every active IOV for a label
+### List active IOVs for a label
+```bash
+curl "http://localhost:8399/label/3b/btr123/cycle123/sampleName?channel_id=0"
 ```
 
-`{label}` is the full hierarchical path, e.g.
-`/valid/3b/btr123/cycle123/sampleName?at=102000`.
+### Valid-at lookup
 
-Add `Content-Type: application/x-yaml` (request) and/or `Accept:
-application/x-yaml` / `?format=yaml` (response) to any of the above to use
-YAML instead of JSON.
-
-### `GET /valid/{label}` API
-
-```
-# Resolve the calibration valid at a given run/time (YAML response)
-GET /valid/3b/btr123/cycle123/sampleName?at=102000&format=yaml
-```
-
-```
-# List active IOVs for a label (JSON, default)
-GET /label/3b/btr123/cycle123/sampleName?channel_id=0
-```
-
-### Correct/replace a range
-```
-PUT /correct/3b/btr123/cycle123/sampleName?channel_id=0
-Content-Type: application/json
-{
-  "since": 100000,
-  "data": {"detectors": [...]},
-  "inserted_by": "bob",
-  "comment": "reprocessed with better cosmic sample"
-}
-```
-
-
-Previously `at` was required. Now, omitting it resolves to the current
-default (the active row with the greatest `since`):
+`at` is optional: omit it to get the current default (the active IOV with
+the greatest `since`); pass it to see what was in effect at a given
+run/time.
 
 ```bash
 # what's the calibration in effect right now?
 curl "http://localhost:8399/valid/3b/btr123/cycle123/sampleName"
 
-# what was it at run 102000?
-curl "http://localhost:8399/valid/3b/btr123/cycle123/sampleName?at=102000"
+# what was it at run 102000? (as YAML)
+curl "http://localhost:8399/valid/3b/btr123/cycle123/sampleName?at=102000&format=yaml"
 ```
 
-### `POST /` API to add a new since point
+### History
+```bash
+curl "http://localhost:8399/history/3b/btr123/cycle123/sampleName?channel_id=0"
+```
 
-To add new calibration constants please use the following syntax
-
+### Adding a new since point
 ```bash
 curl -X POST http://localhost:8399 \
   -H "Content-Type: application/json" \
@@ -200,17 +165,18 @@ curl -X POST http://localhost:8399 \
        "since": 105000, "data": {"dx": 0.011}, "inserted_by": "bob"}'
 ```
 
-If an *active* row already exists at that exact `(label, channel, since)`,
-this now returns `409 Conflict` with `ErrDuplicateSince` (renamed from
-`ErrOverlap`, since there's no range to overlap anymore) you
-may use `PUT /correct/{label}` instead to overwrite it.
+Adding a `since` that's greater than any existing active one automatically
+makes it the new default — no separate step needed to "close" the previous
+entry. If an *active* row already exists at that exact
+`(label, channel, since)`, this returns `409 Conflict` (`ErrDuplicateSince`);
+use `PUT /correct/{label}` instead to overwrite it.
 
-### `PUT /correct/{label}` API to overwrites an existing since point
+### Correcting an existing since point
 
-It overwrites the **exact** `since` you pass — it requires an active row
-already at that `since` (`404` if not, with a message telling you there's
-nothing there to correct), deactivates it, and inserts a new payload/IOV at the
-same `since` with `revision + 1`:
+`PUT /correct/{label}` overwrites the **exact** `since` you pass. It
+requires an active row already at that `since` (`404` otherwise, with a
+message that there's nothing there to correct), deactivates it, and
+inserts a new payload/IOV at the same `since` with `revision + 1`:
 
 ```bash
 curl -X PUT "http://localhost:8399/correct/3b/btr123/cycle123/sampleName?channel_id=0" \
@@ -219,24 +185,24 @@ curl -X PUT "http://localhost:8399/correct/3b/btr123/cycle123/sampleName?channel
        "comment": "fixed a typo in the original entry"}'
 ```
 
-Use `POST` to add a new time period; use `PUT .../correct` to fix a mistake
+Use `POST` to add a new time period; use `PUT /correct` to fix a mistake
 in an existing one.
 
-### `DELETE /iov/{id}` API to delete given IOV
+### Deleting
 
-`{id}` in `DELETE /calibrations/iov/{id}` is the primary key of a single
-**IOV row** — one specific `(label, channel, since, revision)`
-validity interval — not the label and not the payload. You get it back in
-the `id` field of every create/list/valid/history/correct response. This
-retracts exactly that one interval:
+`{id}` in `DELETE /iov/{id}` is the primary key of a single **IOV row** —
+one specific `(label, channel, since, revision)` entry — not the label and
+not the payload. You get it back in the `id` field of every
+create/list/valid/history/correct response. This retracts exactly that one
+entry:
 
 ```bash
 curl -X DELETE http://localhost:8399/iov/17
 # -> 204 No Content
 ```
 
-To retract *every* active interval for a label in one call (optionally
-scoped to a channel), use the new bulk endpoint instead:
+To retract *every* active entry for a label in one call (optionally scoped
+to a channel), use the bulk endpoint instead:
 
 ```bash
 curl -X DELETE "http://localhost:8399/label/3b/btr123/cycle123/sampleName?channel_id=0"
