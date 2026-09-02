@@ -1,11 +1,14 @@
 module github.com/CHESSComputing/CalibrationService
 
-go 1.26.5
+go 1.27.1
+
+replace github.com/CHESSComputing/golib => ../golib
 
 require (
-	github.com/CHESSComputing/golib v1.3.4
+	github.com/CHESSComputing/golib v1.3.5
 	github.com/gin-gonic/gin v1.12.0
 	github.com/jackc/pgx/v5 v5.10.0
+	go.yaml.in/yaml/v3 v3.0.4
 )
 
 require (
@@ -88,7 +91,6 @@ require (
 	go.opentelemetry.io/otel/sdk v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.10.0 // indirect
-	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/arch v0.27.0 // indirect
 	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90 // indirect
@@ -107,5 +109,3 @@ require (
 	gopkg.in/jcmturner/gokrb5.v7 v7.5.0 // indirect
 	gopkg.in/jcmturner/rpc.v1 v1.1.0 // indirect
 )
-
-replace github.com/CHESSComputing/golib => ../golib
