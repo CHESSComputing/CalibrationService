@@ -1,12 +1,12 @@
 module github.com/CHESSComputing/CalibrationService
 
-go 1.27.1
+go 1.27.4
 
 require (
-	github.com/CHESSComputing/golib v1.3.6
+	github.com/CHESSComputing/golib v1.3.7
 	github.com/gin-gonic/gin v1.12.0
-	github.com/jackc/pgx/v5 v5.11.0
-	go.yaml.in/yaml/v3 v3.0.5
+	github.com/jackc/pgx/v5 v5.13.0
+	go.yaml.in/yaml/v3 v3.0.6
 )
 
 require (
@@ -44,7 +44,7 @@ require (
 	github.com/hashicorp/go-uuid v1.0.3 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
-	github.com/jackc/puddle/v2 v2.2.2 // indirect
+	github.com/jackc/puddle/v2 v2.2.3 // indirect
 	github.com/jcmturner/gofork v1.7.6 // indirect
 	github.com/joho/godotenv v1.5.1 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
